@@ -77,7 +77,7 @@ export SSE_KEEPALIVE_INTERVAL=15.0
 ### 3. Run
 
 ```bash
-cd auto_run_stream
+cd CIO-Run-Auto-Orchestrator
 python -m src.main
 # Server starts on http://0.0.0.0:1577
 ```
@@ -85,7 +85,7 @@ python -m src.main
 ### 4. Run Tests
 
 ```bash
-cd auto_run_stream
+cd CIO-Run-Auto-Orchestrator
 pytest tests/ -v --cov=src --cov-report=term-missing
 ```
 
