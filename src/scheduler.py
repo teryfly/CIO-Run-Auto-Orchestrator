@@ -16,23 +16,39 @@ CTD change (auto_run_stream 接口简化)
   - requirement 为空 → 强制 RESUME
   - 若无 checkpoint → 抛 ValueError（由 worker._run_locked 捕获转为 FAILED）
 
-Bug fix (v0.6.2)
+Bug fix (v0.6.3)
 ──────────────────────────────────────
-StateTracker 构造函数第二参数要求一个带 correlation_id 属性的 logger 对象，
-传入 None 会在内部访问 logger.correlation_id 时抛出
-  AttributeError: 'NoneType' object has no attribute 'correlation_id'
-修复方式：将模块级 logger（logging.Logger 实例）传入，替代原来的 None。
+Root cause of 'Logger' object has no attribute 'correlation_id':
+
+  The Scheduler constructor passed the module-level standard Python logger
+  (logging.getLogger(__name__)) to StateTracker:
+
+      self._state_tracker = StateTracker(work_dir, logger=logger)
+
+  StateTracker (and other CIO-Agent internals) require a CIOLogger instance,
+  not a standard logging.Logger.  CIOLogger carries a .correlation_id
+  attribute that CIO-Agent reads at construction time; the standard Logger
+  does not, which is why the AttributeError fires.
+
+Fix:
+  Scheduler now constructs a CIOLogger(work_dir) and passes that to
+  StateTracker.  The module-level `logger` (standard Logger) is kept for
+  Scheduler's own diagnostic output only and is never handed to any
+  CIO-Agent class.
 """
 
 from __future__ import annotations
 
 import logging
 
+from cio.logger import CIOLogger
 from cio.project_store import ProjectStore
 from cio.state_tracker import StateTracker
 
 from .models import Task, TaskMode
 
+# Module-level standard logger — used ONLY for Scheduler's own log output.
+# Never passed to CIO-Agent internals (they need CIOLogger, not Logger).
 logger = logging.getLogger(__name__)
 
 
@@ -49,14 +65,15 @@ class Scheduler:
 
     def __init__(self, work_dir: str) -> None:
         self._work_dir = work_dir
-        # ProjectStore and StateTracker are lightweight; constructing per
-        # Scheduler instance is fine.
         self._project_store = ProjectStore(work_dir)
-        # Bug fix: pass the module-level logger instead of None.
-        # StateTracker internally accesses logger.correlation_id during
-        # initialisation; passing None causes:
-        #   AttributeError: 'NoneType' object has no attribute 'correlation_id'
-        self._state_tracker = StateTracker(work_dir, logger=logger)  # type: ignore[arg-type]
+
+        # Bug fix (v0.6.3): StateTracker requires a CIOLogger instance, NOT a
+        # standard logging.Logger.  CIOLogger carries a .correlation_id
+        # attribute that CIO-Agent internals access at construction time.
+        # Passing logging.getLogger(__name__) here causes:
+        #   AttributeError: 'Logger' object has no attribute 'correlation_id'
+        cio_logger = CIOLogger(work_dir)
+        self._state_tracker = StateTracker(work_dir, logger=cio_logger)
 
     # ---------------------------------------------------------------------- #
     # Public API                                                               #
