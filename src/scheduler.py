@@ -15,6 +15,13 @@ CTD change (auto_run_stream 接口简化)
 在 decide() 最开头增加空 requirement 分支：
   - requirement 为空 → 强制 RESUME
   - 若无 checkpoint → 抛 ValueError（由 worker._run_locked 捕获转为 FAILED）
+
+Bug fix (v0.6.2)
+──────────────────────────────────────
+StateTracker 构造函数第二参数要求一个带 correlation_id 属性的 logger 对象，
+传入 None 会在内部访问 logger.correlation_id 时抛出
+  AttributeError: 'NoneType' object has no attribute 'correlation_id'
+修复方式：将模块级 logger（logging.Logger 实例）传入，替代原来的 None。
 """
 
 from __future__ import annotations
@@ -43,9 +50,13 @@ class Scheduler:
     def __init__(self, work_dir: str) -> None:
         self._work_dir = work_dir
         # ProjectStore and StateTracker are lightweight; constructing per
-        # Scheduler instance is fine for Phase 1.
+        # Scheduler instance is fine.
         self._project_store = ProjectStore(work_dir)
-        self._state_tracker = StateTracker(work_dir, logger=None)  # type: ignore[arg-type]
+        # Bug fix: pass the module-level logger instead of None.
+        # StateTracker internally accesses logger.correlation_id during
+        # initialisation; passing None causes:
+        #   AttributeError: 'NoneType' object has no attribute 'correlation_id'
+        self._state_tracker = StateTracker(work_dir, logger=logger)  # type: ignore[arg-type]
 
     # ---------------------------------------------------------------------- #
     # Public API                                                               #
@@ -70,7 +81,7 @@ class Scheduler:
         """
         project_name = task.project_name
 
-        # ── 新增：空 requirement → 强制 RESUME ──────────────────── #
+        # ── 空 requirement → 强制 RESUME ────────────────────────── #
         if not task.requirement:
             try:
                 self._state_tracker.set_project_name(project_name)
@@ -100,7 +111,6 @@ class Scheduler:
         try:
             project_exists = self._project_store.project_exists(project_name)
         except Exception as exc:
-            # Treat any store error as "project unknown" → safe to run NEW.
             logger.warning(
                 "scheduler.decide: project_exists check failed for %r: %s — defaulting to NEW",
                 project_name,
@@ -109,11 +119,10 @@ class Scheduler:
             project_exists = False
 
         if not project_exists:
-            mode = TaskMode.NEW
             logger.info(
                 "scheduler.decide: project=%r does not exist → mode=NEW", project_name
             )
-            return self._apply(task, mode)
+            return self._apply(task, TaskMode.NEW)
 
         # Project exists — check for a resumable checkpoint.
         try:
@@ -128,18 +137,16 @@ class Scheduler:
             checkpoint_exists = False
 
         if checkpoint_exists:
-            mode = TaskMode.RESUME
             logger.info(
                 "scheduler.decide: project=%r has checkpoint → mode=RESUME", project_name
             )
-        else:
-            mode = TaskMode.SECONDARY
-            logger.info(
-                "scheduler.decide: project=%r exists, no checkpoint → mode=SECONDARY",
-                project_name,
-            )
+            return self._apply(task, TaskMode.RESUME)
 
-        return self._apply(task, mode)
+        logger.info(
+            "scheduler.decide: project=%r exists, no checkpoint → mode=SECONDARY",
+            project_name,
+        )
+        return self._apply(task, TaskMode.SECONDARY)
 
     # ---------------------------------------------------------------------- #
     # Internal helpers                                                         #
