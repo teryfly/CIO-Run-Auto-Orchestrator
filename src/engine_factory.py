@@ -13,16 +13,22 @@ Bug fix (v0.6.3)
 ──────────────────────────────────────────────────────────────────────────────
 Fix: 'Logger' object has no attribute 'correlation_id'
 
-Root cause:
-  CIOLogger wraps / returns a standard Python logging.Logger instance, but
-  CIO-Agent internals (StateTracker, WorkflowEngine) access logger.correlation_id
-  at construction time.  When the attribute is absent the engine raises:
-      AttributeError: 'Logger' object has no attribute 'correlation_id'
+Root cause (revised, v0.6.4):
+  CIOLogger wraps a standard Python logging.Logger instance internally.
+  WorkflowEngine and StateTracker access `logger.correlation_id` on whatever
+  object is passed to them — which may be the raw inner Logger, not the
+  CIOLogger wrapper.  Patching only the outer CIOLogger is insufficient.
 
-Fix:
-  After constructing cio_logger, inject a default correlation_id attribute if
-  it is not already present.  We use a fresh UUID so that each engine build
-  gets a unique trace identifier.
+Fix (v0.6.4):
+  _ensure_correlation_id() now injects correlation_id onto:
+    1. The CIOLogger wrapper itself.
+    2. Any inner `.logger` attribute (the wrapped logging.Logger), which is
+       the object actually accessed by WorkflowEngine / StateTracker internals.
+  This covers both current and future CIOLogger implementations.
+
+  Additionally, the module-level logging.Logger used by Scheduler is also
+  pre-injected so that StateTracker(work_dir, logger=logger) in scheduler.py
+  never raises AttributeError.
 """
 
 from __future__ import annotations
@@ -37,6 +43,14 @@ from .config import settings
 from .scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+# Pre-inject correlation_id onto this module's logger so it can be safely
+# passed to StateTracker (which accesses logger.correlation_id at init time).
+if not hasattr(logger, "correlation_id"):
+    try:
+        logger.correlation_id = uuid.uuid4().hex  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 # Cache key: (work_dir: str, config_hash: str)
 # Cache value: (WorkflowEngine, Scheduler)
@@ -133,27 +147,56 @@ def _merge_with_env_defaults(
     return merged
 
 
+def _inject_correlation_id(obj: object, correlation_id: str) -> None:
+    """
+    Best-effort injection of `correlation_id` onto `obj`.
+
+    Tries three strategies in order:
+      1. Direct attribute assignment (works for most objects).
+      2. object.__setattr__ override (for objects with custom __setattr__).
+      3. Silently gives up — the attribute may already exist via __slots__.
+    """
+    if hasattr(obj, "correlation_id"):
+        return
+    try:
+        obj.correlation_id = correlation_id  # type: ignore[union-attr]
+        return
+    except (AttributeError, TypeError):
+        pass
+    try:
+        object.__setattr__(obj, "correlation_id", correlation_id)
+    except (AttributeError, TypeError):
+        pass
+
+
 def _ensure_correlation_id(cio_logger: object) -> object:
     """
-    Ensure the logger object has a `correlation_id` attribute.
+    Ensure that *both* the CIOLogger wrapper and any inner logging.Logger it
+    wraps have a `correlation_id` attribute.
 
+    Background
+    ──────────
     CIO-Agent internals (StateTracker, WorkflowEngine) access
-    `logger.correlation_id` at construction time.  CIOLogger may wrap a
-    standard logging.Logger that lacks this attribute, causing:
-        AttributeError: 'Logger' object has no attribute 'correlation_id'
+    `logger.correlation_id` at construction time.  Depending on the CIOLogger
+    implementation, they may receive either the CIOLogger wrapper or the raw
+    `logging.Logger` it contains internally (commonly stored as `.logger`).
 
-    We inject a fresh UUID so every engine build gets a unique trace id.
-    This is a no-op when CIOLogger already sets the attribute itself.
+    Patching only the outer wrapper was insufficient (v0.6.3 regression).
+    This version patches both so the attribute is present regardless of which
+    object the internals ultimately receive.
     """
-    if not hasattr(cio_logger, "correlation_id"):
-        try:
-            object.__setattr__(cio_logger, "correlation_id", uuid.uuid4().hex)
-        except (AttributeError, TypeError):
-            # Fallback for objects that don't support __setattr__ override
-            try:
-                cio_logger.correlation_id = uuid.uuid4().hex  # type: ignore[union-attr]
-            except Exception:
-                pass
+    correlation_id = uuid.uuid4().hex
+
+    # 1. Patch the outer CIOLogger wrapper.
+    _inject_correlation_id(cio_logger, correlation_id)
+
+    # 2. Patch any inner logger attribute (the wrapped logging.Logger).
+    #    Common attribute names: 'logger', '_logger', 'log', '_log'.
+    for attr in ("logger", "_logger", "log", "_log"):
+        inner = getattr(cio_logger, attr, None)
+        if inner is not None and isinstance(inner, logging.Logger):
+            _inject_correlation_id(inner, correlation_id)
+
     return cio_logger
 
 
@@ -203,9 +246,9 @@ def _build_engine_and_scheduler(
     config.validate()
 
     cio_logger = CIOLogger(config.work_dir)
-    # Bug fix (v0.6.3): inject correlation_id if CIOLogger does not set it.
-    # CIO-Agent internals access logger.correlation_id at construction time;
-    # a plain logging.Logger wrapping inside CIOLogger lacks this attribute.
+    # Bug fix (v0.6.4): inject correlation_id onto BOTH the CIOLogger wrapper
+    # AND its inner logging.Logger, because CIO-Agent internals may access
+    # logger.correlation_id on either object depending on implementation.
     _ensure_correlation_id(cio_logger)
 
     store = ProjectStore(config.work_dir)
