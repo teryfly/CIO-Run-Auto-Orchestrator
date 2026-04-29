@@ -9,32 +9,20 @@ Bug fix (v0.6.2)
 ──────────────────────────────────────────────────────────────────────────────
 Fix: work_dir priority not honoured — config_json internal work_dir ignored.
 
-Root cause (two-part):
+Bug fix (v0.6.3)
+──────────────────────────────────────────────────────────────────────────────
+Fix: 'Logger' object has no attribute 'correlation_id'
 
-  1. get_engine_and_scheduler() resolved work_dir as:
-         resolved_work_dir = (work_dir or "").strip() or settings.cio_work_dir
-     When the request-level work_dir is empty (""), this immediately falls back
-     to the CIO_WORK_DIR env var, completely skipping any work_dir embedded
-     inside config_json.
+Root cause:
+  CIOLogger wraps / returns a standard Python logging.Logger instance, but
+  CIO-Agent internals (StateTracker, WorkflowEngine) access logger.correlation_id
+  at construction time.  When the attribute is absent the engine raises:
+      AttributeError: 'Logger' object has no attribute 'correlation_id'
 
-  2. _merge_with_env_defaults() contained:
-         merged["work_dir"] = work_dir   # last line — always overwrites
-     This forced the already-wrong resolved_work_dir onto the merged config,
-     discarding whatever work_dir the caller had put inside config_json.
-
-Correct priority order (from api_contract.md / README.md):
-  1. Request-level work_dir param  (highest — always wins when non-empty)
-  2. work_dir key inside config_json
-  3. CIO_WORK_DIR env var          (lowest fallback)
-
-Fixed implementation:
-  - get_engine_and_scheduler() now extracts config_json["work_dir"] as an
-    intermediate fallback before reaching the env-var default.
-  - _merge_with_env_defaults() no longer blindly overwrites merged["work_dir"];
-    the final resolved work_dir is already correct when it arrives here and is
-    only used to fill the baseline — the merged dict (which may contain a
-    caller-supplied work_dir) takes precedence via {**baseline, **parsed},
-    after which we apply the single authoritative value passed in.
+Fix:
+  After constructing cio_logger, inject a default correlation_id attribute if
+  it is not already present.  We use a fresh UUID so that each engine build
+  gets a unique trace identifier.
 """
 
 from __future__ import annotations
@@ -42,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import uuid
 from typing import Any, Dict, Optional, Tuple
 
 from .config import settings
@@ -79,13 +68,6 @@ def _resolve_work_dir(request_work_dir: Optional[str], config_json: str) -> str:
       1. request-level work_dir  (non-empty → wins immediately)
       2. work_dir inside config_json
       3. CIO_WORK_DIR env var    (final fallback)
-
-    Parameters
-    ----------
-    request_work_dir:
-        The work_dir supplied at the POST /tasks request level (may be None/"").
-    config_json:
-        The raw config_json string (may be empty).
     """
     # Priority 1 — explicit request param
     candidate = (request_work_dir or "").strip()
@@ -116,9 +98,6 @@ def _merge_with_env_defaults(
     The `resolved_work_dir` parameter is the already-prioritised work_dir
     (request param > config_json > env var).  It is injected last so that
     it always wins regardless of what was in `parsed["work_dir"]`.
-
-    Only model and api_key emptiness is validated here — other missing
-    fields have sensible built-in defaults inside CIO-Agent.
     """
     baseline: Dict[str, Any] = {
         "model": settings.cio_model,
@@ -152,6 +131,30 @@ def _merge_with_env_defaults(
         )
 
     return merged
+
+
+def _ensure_correlation_id(cio_logger: object) -> object:
+    """
+    Ensure the logger object has a `correlation_id` attribute.
+
+    CIO-Agent internals (StateTracker, WorkflowEngine) access
+    `logger.correlation_id` at construction time.  CIOLogger may wrap a
+    standard logging.Logger that lacks this attribute, causing:
+        AttributeError: 'Logger' object has no attribute 'correlation_id'
+
+    We inject a fresh UUID so every engine build gets a unique trace id.
+    This is a no-op when CIOLogger already sets the attribute itself.
+    """
+    if not hasattr(cio_logger, "correlation_id"):
+        try:
+            object.__setattr__(cio_logger, "correlation_id", uuid.uuid4().hex)
+        except (AttributeError, TypeError):
+            # Fallback for objects that don't support __setattr__ override
+            try:
+                cio_logger.correlation_id = uuid.uuid4().hex  # type: ignore[union-attr]
+            except Exception:
+                pass
+    return cio_logger
 
 
 def _build_engine_and_scheduler(
@@ -200,6 +203,11 @@ def _build_engine_and_scheduler(
     config.validate()
 
     cio_logger = CIOLogger(config.work_dir)
+    # Bug fix (v0.6.3): inject correlation_id if CIOLogger does not set it.
+    # CIO-Agent internals access logger.correlation_id at construction time;
+    # a plain logging.Logger wrapping inside CIOLogger lacks this attribute.
+    _ensure_correlation_id(cio_logger)
+
     store = ProjectStore(config.work_dir)
     namer = ProjectNamer(config.api_key)
     engine = WorkflowEngine(config, cio_logger, store, namer)
@@ -255,10 +263,6 @@ class EngineFactory:
 
     Wraps the module-level get_engine_and_scheduler() cache so workers
     can call `await self._factory.get(work_dir, config_json)`.
-
-    The `get` method is async-compatible (runs synchronous construction
-    in the calling thread — construction is fast after the first build
-    because results are cached).
     """
 
     async def get(
